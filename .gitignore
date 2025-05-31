@@ -167,6 +167,7 @@ har/
 postgres-data
 files/
 temp/
+artifacts/
 
 # Streamlit ignores
 **/secrets*.toml
