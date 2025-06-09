@@ -20,7 +20,7 @@ from urllib.parse import quote
 import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import Template
+from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -46,7 +46,7 @@ from skyvern.forge.sdk.api.files import (
     download_from_s3,
     get_path_for_workflow_download_directory,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
@@ -77,6 +77,7 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+jinja_sandbox_env = SandboxedEnvironment()
 
 
 class BlockType(StrEnum):
@@ -184,7 +185,7 @@ class Block(BaseModel, abc.ABC):
     ) -> str:
         if not potential_template:
             return potential_template
-        template = Template(potential_template)
+        template = jinja_sandbox_env.from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
@@ -628,9 +629,6 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
-                llm_key = workflow.determine_llm_key(block=self)
-                llm_caller = None if not llm_key else LLMCaller(llm_key=llm_key)
-
                 await app.agent.execute_step(
                     organization=organization,
                     task=task,
@@ -640,7 +638,6 @@ class BaseTaskBlock(Block):
                     close_browser_on_completion=browser_session_id is None,
                     complete_verification=self.complete_verification,
                     engine=self.engine,
-                    llm_caller=llm_caller,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception

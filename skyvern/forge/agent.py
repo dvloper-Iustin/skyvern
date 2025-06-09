@@ -174,6 +174,7 @@ class ForgeAgent:
             max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
+            model=task_block.model,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -209,7 +210,7 @@ class ForgeAgent:
         )
         return task, step
 
-    async def create_task(self, task_request: TaskRequest, organization_id: str | None = None) -> Task:
+    async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
         webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
         task = await app.DATABASE.create_task(
@@ -382,14 +383,20 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
-            if not llm_caller:
+            if engine == RunEngine.anthropic_cua and not llm_caller:
+                # see if the llm_caller is already set in memory
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if engine == RunEngine.anthropic_cua and not llm_caller:
-                    # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
-                    llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                    if not llm_caller:
-                        llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
-                        LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
+                if not llm_caller:
+                    # if not, create a new llm_caller
+                    llm_key = task.llm_key
+                    llm_caller = LLMCaller(
+                        llm_key=llm_key or settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True
+                    )
+
+            # TODO: remove the code after migrating everything to llm callers
+            # currently, only anthropic cua tasks use llm_caller
+            if engine == RunEngine.anthropic_cua and llm_caller:
+                LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
             step, detailed_output = await self.agent_step(
                 task,
@@ -860,12 +867,13 @@ class ForgeAgent:
                 else:
                     if engine in CUA_ENGINES:
                         self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
+
                     json_response = await app.LLM_API_HANDLER(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
                         step=step,
                         screenshots=scraped_page.screenshots,
-                        llm_key_override=llm_caller.llm_key if llm_caller else None,
+                        llm_key_override=task.llm_key,
                     )
                     try:
                         json_response = await self.handle_potential_verification_code(
@@ -1481,8 +1489,10 @@ class ForgeAgent:
         )
         run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
         scroll = True
+        llm_key_override = task.llm_key
         if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
             scroll = False
+            llm_key_override = None
 
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
@@ -1502,11 +1512,13 @@ class ForgeAgent:
         )
 
         # this prompt is critical to our agent so let's use the primary LLM API handler
+
         verification_result = await app.LLM_API_HANDLER(
             prompt=verification_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name="check-user-goal",
+            llm_key_override=llm_key_override,
         )
         return CompleteVerifyResult.model_validate(verification_result)
 
@@ -2433,10 +2445,25 @@ class ForgeAgent:
                 step_retry=step.retry_index,
                 max_retries=settings.MAX_RETRIES_PER_STEP,
             )
+            browser_state = app.BROWSER_MANAGER.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
+            page = None
+            if browser_state is not None:
+                page = await browser_state.get_working_page()
+
+            failure_reason = await self.summary_failure_reason_for_max_retries(
+                organization=organization,
+                task=task,
+                step=step,
+                page=page,
+                max_retries=max_retries_per_step,
+            )
+
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=f"Max retries per step ({max_retries_per_step}) exceeded",
+                failure_reason=(
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                ),
             )
             return None
         else:
@@ -2516,6 +2543,72 @@ class ForgeAgent:
             if steps_results:
                 last_step_result = steps_results[-1]
                 return f"Step {last_step_result['order']}: {last_step_result['actions_result']}"
+            return ""
+
+    async def summary_failure_reason_for_max_retries(
+        self,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        page: Page | None,
+        max_retries: int,
+    ) -> str:
+        html = ""
+        screenshots: list[bytes] = []
+        steps_results = []
+        try:
+            steps = await app.DATABASE.get_task_steps(
+                task_id=task.task_id, organization_id=organization.organization_id
+            )
+            for step_cnt, cur_step in enumerate(steps[-max_retries:]):
+                if cur_step.output and cur_step.output.actions_and_results:
+                    action_result_summary: list[str] = []
+                    step_result: dict[str, Any] = {
+                        "order": step_cnt,
+                    }
+                    for action, action_results in cur_step.output.actions_and_results:
+                        if len(action_results) == 0:
+                            continue
+                        last_result = action_results[-1]
+                        if last_result.success:
+                            continue
+                        reason = last_result.exception_message or ""
+                        action_result_summary.append(
+                            f"{action.reasoning}(action_type={action.action_type}, result=failed, reason={reason})"
+                        )
+                    step_result["actions_result"] = action_result_summary
+                    steps_results.append(step_result)
+
+            if page is not None:
+                skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+                html = await skyvern_frame.get_content()
+                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+
+            prompt = prompt_engine.load_prompt(
+                "summarize-max-retries-reason",
+                navigation_goal=task.navigation_goal,
+                navigation_payload=task.navigation_payload,
+                steps=steps_results,
+                page_html=html,
+                max_retries=max_retries,
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            )
+            json_response = await app.LLM_API_HANDLER(
+                prompt=prompt,
+                screenshots=screenshots,
+                step=step,
+                prompt_name="summarize-max-retries-reason",
+            )
+            return json_response.get("reasoning", "")
+        except Exception:
+            LOG.warning(
+                "Failed to summarize the failure reason for max retries",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            if steps_results:
+                last_step_result = steps_results[-1]
+                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
             return ""
 
     async def handle_completed_step(
@@ -2675,11 +2768,16 @@ class ForgeAgent:
                 verification_code_check=False,
                 expire_verification_code=True,
             )
+            llm_key_override = task.llm_key
+            run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
+            if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
+                llm_key_override = None
             return await app.LLM_API_HANDLER(
                 prompt=extract_action_prompt,
                 step=step,
                 screenshots=scraped_page.screenshots,
                 prompt_name="extract-actions",
+                llm_key_override=llm_key_override,
             )
         return json_response
 

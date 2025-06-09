@@ -231,7 +231,7 @@ class Task(TaskBase):
         None,
         description="The reason for the task failure.",
     )
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_permanent_id: str | None = None
     order: int | None = None
@@ -251,7 +251,7 @@ class Task(TaskBase):
             model_name = self.model.get("model_name")
             if model_name:
                 mapping = settings.get_model_name_to_llm_key()
-                return mapping.get(model_name)
+                return mapping.get(model_name, {}).get("llm_key")
 
         return None
 
@@ -370,4 +370,4 @@ class SortDirection(StrEnum):
 
 
 class ModelsResponse(BaseModel):
-    models: list[str]
+    models: dict[str, str]

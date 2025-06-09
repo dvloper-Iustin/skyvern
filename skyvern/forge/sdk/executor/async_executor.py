@@ -5,7 +5,6 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -14,6 +13,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunType
 from skyvern.services import task_v2_service
+from skyvern.utils.files import initialize_skyvern_state_file
 
 LOG = structlog.get_logger()
 
@@ -106,10 +106,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
 
-        llm_key = task.llm_key
-        llm_caller = LLMCaller(llm_key) if llm_key else None
-
         if background_tasks:
+            await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
             background_tasks.add_task(
                 app.agent.execute_step,
                 organization,
@@ -119,7 +117,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
                 engine=engine,
-                llm_caller=llm_caller,
             )
 
     async def execute_workflow(
@@ -140,6 +137,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         if background_tasks:
+            await initialize_skyvern_state_file(
+                workflow_run_id=workflow_run_id, organization_id=organization.organization_id
+            )
             background_tasks.add_task(
                 app.WORKFLOW_SERVICE.execute_workflow,
                 workflow_run_id=workflow_run_id,
@@ -183,6 +183,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         if background_tasks:
+            await initialize_skyvern_state_file(
+                workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id
+            )
             background_tasks.add_task(
                 task_v2_service.run_task_v2,
                 organization=organization,

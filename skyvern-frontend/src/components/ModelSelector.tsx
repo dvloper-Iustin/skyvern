@@ -21,6 +21,10 @@ type Props = {
   onChange: (value: WorkflowModel | null) => void;
 };
 
+const constants = {
+  SkyvernOptimized: "Skyvern Optimized",
+} as const;
+
 function ModelSelector({
   clearable = true,
   value,
@@ -37,7 +41,17 @@ function ModelSelector({
     },
   });
 
-  const models = availableModels?.models ?? [];
+  const models = availableModels?.models ?? {};
+  const reverseMap = Object.entries(models).reduce(
+    (acc, [key, value]) => {
+      acc[value] = key;
+      return acc;
+    },
+    {} as Record<string, string>,
+  );
+  const labels = Object.keys(reverseMap);
+  const chosen = value ? models[value.model_name] : constants.SkyvernOptimized;
+  const choices = [constants.SkyvernOptimized, ...labels];
 
   return (
     <div className="flex items-center justify-between">
@@ -47,20 +61,28 @@ function ModelSelector({
       </div>
       <div className="relative flex items-center">
         <Select
-          value={value?.model ?? ""}
+          value={chosen}
           onValueChange={(v) => {
-            onChange({ model: v });
+            const newValue = v === constants.SkyvernOptimized ? null : v;
+            const modelName = newValue ? reverseMap[newValue] : null;
+            const value = modelName ? { model_name: modelName } : null;
+            console.log({ v, newValue, modelName, value });
+            onChange(value);
           }}
         >
           <SelectTrigger
             className={(className || "") + (value && clearable ? " pr-10" : "")}
           >
-            <SelectValue placeholder="Skyvern Optimized" />
+            <SelectValue placeholder={constants.SkyvernOptimized} />
           </SelectTrigger>
           <SelectContent>
-            {models.map((m) => (
+            {choices.map((m) => (
               <SelectItem key={m} value={m}>
-                {m}
+                {m === constants.SkyvernOptimized ? (
+                  <span>Skyvern Optimized ✨</span>
+                ) : (
+                  m
+                )}
               </SelectItem>
             ))}
           </SelectContent>
